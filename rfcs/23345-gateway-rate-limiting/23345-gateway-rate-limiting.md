@@ -8,7 +8,7 @@ rfc_pr:
 
 | Author(s)              | [2sumtech](https://github.com/2sumtech) |
 | :--------------------- | :-------------------------------------- |
-| **Date Last Modified** | 2026-10-09                              |
+| **Date Last Modified** | 2026-10-24                              |
 
 <!-- markdownlint-disable MD025 -->
 
@@ -176,10 +176,14 @@ message GatewayRateLimitConfig {
 }
 ```
 
-`GatewayEndpoint` gains `repeated GatewayRateLimit rate_limits`. `CreateGatewayEndpoint` and
-`UpdateGatewayEndpoint` gain `optional GatewayRateLimitConfig rate_limit_config`. The wrapper message exists so an
-update can tell "leave rate limits alone" (wrapper absent) apart from "remove all rate limits" (wrapper present with
-an empty list). A bare `repeated` field cannot express that difference.
+`GatewayEndpoint`, `CreateGatewayEndpoint`, and `UpdateGatewayEndpoint` all gain
+`optional GatewayRateLimitConfig rate_limit_config`. Reads and writes use the same shape, as `fallback_config` does,
+so a client can send back what it read. A bare `rate_limits` list on reads would not round-trip: the request parser
+drops unknown fields, so sending it back in an update would succeed without changing the limits.
+
+The wrapper message exists so an update can tell "leave rate limits alone" (wrapper absent) apart from "remove all
+rate limits" (wrapper present with an empty list). A bare `repeated` field cannot express that difference. On reads,
+`rate_limit_config` is omitted when the endpoint has no rate limits.
 
 Enum values in `service.proto` share the `mlflow` package scope, so they must not repeat names used by other enums.
 `SERVICE`, `USER_DEFAULT`, `MINUTE`, and `HOUR` are currently free; `BudgetDurationUnit` uses `MINUTES` and `HOURS`,
@@ -250,8 +254,8 @@ passthrough route (OpenAI chat, embeddings, and responses; Anthropic messages; G
 `typesafe` passthrough, and `raw_proxy`. Each site has already resolved `endpoint_config` through
 `get_endpoint_config` and has the `Request`.
 
-A new `check_rate_limit(endpoint_config, request)` is called immediately **after** `check_budget_limit` at each of
-those sites. The order matters:
+A new `async` `check_rate_limit(endpoint_config, request)` is awaited immediately **after** `check_budget_limit` at
+each of those sites. The order matters:
 
 - The budget check does not record anything, so running it first costs nothing.
 - The rate limit check does record an admitted request. Running it last, just before guardrails and the provider
@@ -365,8 +369,9 @@ spend from trace history (`calculate_existing_cost_for_windows`). Rate limits ha
 server should log a warning at startup when rate limits are in use, there is more than one worker, and no Redis URL is
 set. The docs should say plainly that the in-process tracker is exact only with one worker and one replica.
 
-**Redis tracker.** Uses the same client setup as `RedisBudgetTracker` (`mlflow/gateway/budget_tracker/redis.py`), which
-already runs atomic Lua scripts (`_ENSURE_WINDOW_LUA`, `_RECORD_COST_LUA`). One script does the whole admission step:
+**Redis tracker.** Follows the pattern of `RedisBudgetTracker` (`mlflow/gateway/budget_tracker/redis.py`), which
+already runs atomic Lua scripts (`_ENSURE_WINDOW_LUA`, `_RECORD_COST_LUA`), but builds its own client with timeouts
+(see [When Redis is unavailable](#when-redis-is-unavailable)). One script does the whole admission step:
 
 1. Read the server clock with `TIME`, so all replicas agree on the window index even if their clocks drift.
 2. Build each counter key from the index, for example `mlflow:ratelimit:{endpoint_id}:USER_DEFAULT:{caller_hash}:MINUTE:{index}`.
@@ -377,12 +382,92 @@ The caller identity is hashed (SHA-256, truncated) in the key. This keeps keys s
 out of plain view in Redis. One script call per request is one Redis round trip, the same cost the budget check already
 pays.
 
-**When Redis is unavailable.** The default is to fail open: admit the request, log at warning level with rate
-limiting so the log is not flooded, and count the failure. Rejecting all gateway traffic because the limiter's cache is
-down would make an optional protection the cause of an outage. Operators who prefer the opposite can set
-`MLFLOW_GATEWAY_RATE_LIMIT_FAIL_CLOSED=true`. The tracker then rejects requests to rate-limited endpoints with HTTP 503
+### When Redis is unavailable
+
+The default is to fail open: admit the request, log at warning level with rate limiting so the log is not flooded,
+and count the failure. Rejecting all gateway traffic because the limiter's cache is down would make an optional
+protection the cause of an outage. Operators who prefer the opposite can set
+`MLFLOW_GATEWAY_RATE_LIMIT_FAIL_CLOSED=true`. Requests to rate-limited endpoints are then rejected with HTTP 503
 (`TEMPORARILY_UNAVAILABLE`, which `mlflow/exceptions.py` already maps to 503) while Redis cannot be reached. Endpoints
 without `rate_limits` never call the tracker, so they are not affected either way.
+
+Failing open is the usual default for request rate limiters. Envoy's rate limit filter only denies traffic when the
+rate limit service is unreachable if `failure_mode_deny` is set, Kong's rate limiting plugin proxies requests when its
+data store is unreachable unless `fault_tolerant` is turned off, and Stripe's write-up on its rate limiters says
+errors in the limiter or Redis should fail open. It also fits what the limit protects here: if the gateway admits
+too much during an outage, the provider's own per-key quota still applies. Budgets are different, because a spend
+cap has no such backstop, so the budget check fails closed by default (see
+[Budget check when Redis is unavailable](#budget-check-when-redis-is-unavailable), which also explains how the two
+settings combine).
+
+Failing open only works if a Redis failure turns into a prompt error that the gateway catches. Three things make that
+hold.
+
+**Bounded calls.** `RedisBudgetTracker` creates its client with `redis.Redis.from_url(url, decode_responses=True)`
+and no timeouts, so a Redis that accepts connections but stops answering blocks the caller indefinitely and no error
+is ever raised. The rate limit tracker builds its own client with a short connect and read timeout
+(`MLFLOW_GATEWAY_RATE_LIMIT_REDIS_TIMEOUT_SECONDS`, default `0.1`) and with client retries disabled, so a failed call
+costs at most one timeout and then raises.
+
+**Off the event loop.** The gateway routes are `async`, and a synchronous Redis call made directly inside one stalls
+every request on that worker, not only the one being checked. `check_rate_limit` is `async` and runs
+`tracker.try_acquire` through `starlette.concurrency.run_in_threadpool`. The tracker interface stays synchronous and
+the same for both implementations, and the in-process tracker's `threading.Lock` remains correct when called from
+threadpool workers. An async Redis client (`redis.asyncio`) would also work, but the threadpool keeps the rate limit
+tracker consistent with the budget tracker, which needs the same treatment (below).
+
+**Error handling in `check_rate_limit`.** `check_rate_limit` catches `redis.RedisError`, which covers connection
+errors and timeouts, and applies the policy: admit and log a warning by default, or raise the 503 when
+`MLFLOW_GATEWAY_RATE_LIMIT_FAIL_CLOSED=true`. Other exceptions are bugs and are not caught. The in-process tracker
+never raises `RedisError`, so this path only applies to the Redis tracker.
+
+#### Budget check when Redis is unavailable
+
+`check_budget_limit` runs before `check_rate_limit` and, with the default configuration, uses the same Redis. Today
+there is no setting for how it behaves when Redis is down, and the behavior it has is a side effect of an uncaught
+exception:
+
+- `RedisBudgetTracker.should_reject_request` calls Redis (`smembers`, `hgetall`) without catching errors, and
+  `check_budget_limit` does not catch them either, so the request fails with an HTTP 500. The policy refresh
+  (`maybe_refresh_budget_policies`) and cost recording (`make_budget_on_complete`) already catch and log their
+  errors; only the admission check does not.
+- The check runs for every gateway request whenever a budget Redis URL is set, so an outage currently fails every
+  endpoint, not only endpoints with budget policies.
+- `check_budget_limit` is synchronous and called directly from the `async` routes, and its client has no timeouts,
+  so a hung Redis stalls the worker instead of failing the request.
+
+This RFC keeps the current outcome, rejecting requests, as the default and makes it an explicit, configurable
+policy. A new `MLFLOW_GATEWAY_BUDGET_FAIL_CLOSED` setting, default `true`, controls it. The budget check gets the
+same three treatments as the rate limit check:
+
+1. `RedisBudgetTracker` uses the same short connect and read timeout, with client retries disabled.
+2. `check_budget_limit` becomes `async` and runs its tracker calls through `run_in_threadpool`.
+3. `check_budget_limit` catches `redis.RedisError` from `should_reject_request` and applies the policy. With
+   `MLFLOW_GATEWAY_BUDGET_FAIL_CLOSED=true` (the default) it rejects the request with HTTP 503
+   (`TEMPORARILY_UNAVAILABLE`) and logs a rate-limited warning. With `false` it logs the warning and admits the
+   request. No budget error trace is written in either case.
+
+The only change clients see by default is the status code during a Redis outage: 503 instead of 500, which tells
+them the failure is temporary and the request can be retried.
+
+**How the two settings combine.** Because the budget check runs first and fails closed by default, a shared Redis
+outage is rejected there with a 503 before the rate limiter runs. The rate limiter's fail-open default takes effect
+only when the budget check is not affected by the same outage: `MLFLOW_GATEWAY_BUDGET_FAIL_CLOSED=false`, budgets
+using the in-process tracker (no `MLFLOW_GATEWAY_BUDGET_REDIS_URL`), or rate limits on a separate Redis
+(`MLFLOW_GATEWAY_RATE_LIMIT_REDIS_URL`). With both checks on one Redis:
+
+| Budget fail closed | Rate limit fail closed | Endpoint with rate limits | Endpoint without rate limits |
+| --- | --- | --- | --- |
+| `true` (default) | `false` (default) | 503 from the budget check | 503 from the budget check |
+| `true` | `true` | 503 from the budget check | 503 from the budget check |
+| `false` | `false` | Admitted, with warnings | Admitted, with a warning |
+| `false` | `true` | 503 from the rate limit check | Admitted, with a warning |
+
+The feature docs must include this table, since an operator who sets only the rate limit setting may otherwise
+expect requests to be admitted during an outage.
+
+The budget changes are a separate PR with a changelog note for the new setting and the 500 to 503 change, and
+they land before the Redis rate limit tracker (see [Adoption strategy](#adoption-strategy)).
 
 ### Rejection response
 
@@ -422,14 +507,14 @@ The field follows the path that `fallback_config` and `usage_tracking` already t
 | Layer | Change |
 | --- | --- |
 | `mlflow/protos/service.proto` | Messages above; Python and Java stubs regenerated with `dev/generate-protos.sh` (Docker) |
-| `mlflow/entities/gateway_endpoint.py` | `rate_limits` on `GatewayEndpoint`, with proto conversion |
+| `mlflow/entities/gateway_endpoint.py` | `rate_limit_config` on `GatewayEndpoint`, with proto conversion |
 | `mlflow/store/tracking/dbmodels/models.py` | `rate_limits_json` `Text` column on `SqlGatewayEndpoint`, stored like `fallback_config_json` |
 | `mlflow/store/db_migrations/versions/` | One Alembic migration adding the nullable column |
 | `mlflow/store/tracking/gateway/abstract_mixin.py`, `sqlalchemy_mixin.py`, `rest_mixin.py` | `rate_limits` argument on `create_gateway_endpoint` / `update_gateway_endpoint` |
 | `mlflow/store/tracking/gateway/entities.py`, `config_resolver.py` | `rate_limits` on `GatewayEndpointConfig`, filled in `get_endpoint_config` |
 | `mlflow/server/handlers.py` | Pass the field through the create / update handlers |
 | `mlflow/gateway/rate_limit.py`, `mlflow/gateway/rate_limit_tracker/` | `check_rate_limit` and the trackers |
-| `mlflow/server/gateway_api.py` | One call next to each `check_budget_limit` |
+| `mlflow/server/gateway_api.py` | One `await check_rate_limit(...)` next to each `check_budget_limit` |
 
 Storing the list as JSON on the endpoint row, instead of a separate table, matches how `fallback_config` is stored.
 It also fits the data: at most four small entries, always read together with the endpoint, and never queried on their
@@ -460,13 +545,17 @@ an endpoint update.
    as the identity it is given.
 4. **More surface area.** A new proto message, a column, a migration, a tracker package, and eleven call sites. The
    tracker package largely repeats the budget tracker structure, and a later refactor could share the Redis client
-   setup and backend selection.
+   setup and backend selection. It also needs a prerequisite change to the budget check (timeouts, explicit error
+   handling with `MLFLOW_GATEWAY_BUDGET_FAIL_CLOSED`, and moving the call off the event loop).
 5. **A second meaning of "user".** Budget policies use `USER` scope with a specific username in `target_value`.
    Rate limits use `USER_DEFAULT` to mean "each caller". The names follow Databricks, but users of both features have
    to learn the difference.
 6. **Could this be done outside MLflow?** Partly. An API gateway or reverse proxy in front of MLflow can rate limit by
    IP. It cannot see MLflow usernames or endpoint IDs inside a path such as `/gateway/mlflow/v1/chat/completions`,
    where the endpoint name is in the request body. That is why the limits belong inside the gateway.
+7. **Two failure settings to understand.** The budget check fails closed by default and the rate limit check fails
+   open by default. Because the budget check runs first, a shared Redis outage is rejected by default even though
+   rate limits fail open, and operators have to read both settings together.
 
 # Alternatives
 
@@ -519,11 +608,14 @@ legacy gateway lacked.
 
 Suggested implementation order, each step a separate PR:
 
-1. Schema, storage, and REST plumbing, with validation. No enforcement yet.
-2. `check_rate_limit` and the in-process tracker, wired into all gateway routes, with the multi-worker warning.
-3. The Redis tracker.
-4. Docs, next to `docs/docs/genai/governance/ai-gateway/budget-alerts-limits.mdx`.
-5. UI, separately.
+1. Budget check hardening: Redis timeouts, `async` `check_budget_limit` with `run_in_threadpool`, and
+   `MLFLOW_GATEWAY_BUDGET_FAIL_CLOSED` (default `true`, 503 on Redis errors), with a changelog note (see
+   [Budget check when Redis is unavailable](#budget-check-when-redis-is-unavailable)).
+2. Schema, storage, and REST plumbing, with validation. No enforcement yet.
+3. `check_rate_limit` and the in-process tracker, wired into all gateway routes, with the multi-worker warning.
+4. The Redis tracker, with timeouts and the fail-open / fail-closed handling.
+5. Docs, next to `docs/docs/genai/governance/ai-gateway/budget-alerts-limits.mdx`.
+6. UI, separately.
 
 # Open questions
 
